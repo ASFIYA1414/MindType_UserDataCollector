@@ -1,16 +1,23 @@
 from database import init_db
-from listener import start_listener
+from listener import start_listener, stop_listener
 from features import compute_and_save_features, update_last_n_labels
 from popup import show_popup
+
 import time
 import tkinter as tk
 
+
+# --------------------------------------------
+# USER ID SETUP WINDOW
+# --------------------------------------------
 def get_user_id():
     result = {"value": None}
 
     def submit():
-        result["value"] = entry.get()
-        root.destroy()
+        value = entry.get().strip()
+        if value:
+            result["value"] = value
+            root.destroy()
 
     root = tk.Tk()
     root.title("MindType Setup")
@@ -28,11 +35,17 @@ def get_user_id():
     return result["value"]
 
 
+# --------------------------------------------
+# MAIN PROGRAM
+# --------------------------------------------
 def main():
     init_db()
 
     user_id = get_user_id()
-    session_id = 1
+
+    if not user_id:
+        print("Invalid User ID. Exiting.")
+        return
 
     start_listener(user_id)
 
@@ -41,7 +54,9 @@ def main():
     session_start = time.time()
     window_index = 0
 
-    # Drift system
+    # -----------------------------
+    # Drift Baseline Initialization
+    # -----------------------------
     baseline = {
         "avg_hold": None,
         "avg_pause": None,
@@ -50,72 +65,76 @@ def main():
     }
 
     BASELINE_ALPHA = 0.2
-    DRIFT_THRESHOLD = 0.5
+    DRIFT_THRESHOLD = 1.5   # Adjusted for normalized drift
     last_popup_time = 0
-    POPUP_COOLDOWN = 120  # seconds
+    POPUP_COOLDOWN = 450  # seconds
 
     try:
         while True:
             current_time = time.time()
 
+            # Every 60 seconds compute features
             if current_time >= session_start + (window_index + 1) * 60:
+
                 window_start = session_start + window_index * 60
                 window_end = window_start + 60
 
+                # NOTE: session_id removed (fixes mismatch bug)
                 features = compute_and_save_features(
                     user_id,
-                    session_id,
-                    window_start,
-                    window_end
+                    session_id=None,  # ignored internally
+                    start_time=window_start,
+                    end_time=window_end
                 )
 
                 if features is not None:
 
+                    # -----------------------------
                     # Initialize baseline
+                    # -----------------------------
                     if baseline["avg_hold"] is None:
-                        baseline["avg_hold"] = features["avg_hold"]
-                        baseline["avg_pause"] = features["avg_pause"]
-                        baseline["kpm"] = features["kpm"]
-                        baseline["backspace_rate"] = features["backspace_rate"]
+                        baseline = {
+                            "avg_hold": features["avg_hold"],
+                            "avg_pause": features["avg_pause"],
+                            "kpm": features["kpm"],
+                            "backspace_rate": features["backspace_rate"]
+                        }
 
-                    # Compute drift score
-                    drift_score = (
-                        abs(features["avg_hold"] - baseline["avg_hold"]) +
-                        abs(features["avg_pause"] - baseline["avg_pause"]) +
-                        abs(features["kpm"] - baseline["kpm"]) / 100 +
-                        abs(features["backspace_rate"] - baseline["backspace_rate"])
-                    )
+                    else:
+                        # -----------------------------
+                        # Normalized Drift Calculation
+                        # -----------------------------
+                        drift_score = (
+                            abs((features["avg_hold"] - baseline["avg_hold"]) / (baseline["avg_hold"] + 1e-6)) +
+                            abs((features["avg_pause"] - baseline["avg_pause"]) / (baseline["avg_pause"] + 1e-6)) +
+                            abs((features["kpm"] - baseline["kpm"]) / (baseline["kpm"] + 1e-6)) +
+                            abs((features["backspace_rate"] - baseline["backspace_rate"]) /
+                                (baseline["backspace_rate"] + 1e-6))
+                        )
 
-                    print("Drift score:", drift_score)
+                        print("Drift score:", round(drift_score, 3))
 
-                    # Update baseline (EMA)
-                    baseline["avg_hold"] = (
-                        BASELINE_ALPHA * features["avg_hold"] +
-                        (1 - BASELINE_ALPHA) * baseline["avg_hold"]
-                    )
+                        # -----------------------------
+                        # Update baseline using EMA
+                        # -----------------------------
+                        for key in baseline:
+                            baseline[key] = (
+                                BASELINE_ALPHA * features[key] +
+                                (1 - BASELINE_ALPHA) * baseline[key]
+                            )
 
-                    baseline["avg_pause"] = (
-                        BASELINE_ALPHA * features["avg_pause"] +
-                        (1 - BASELINE_ALPHA) * baseline["avg_pause"]
-                    )
+                        # -----------------------------
+                        # Trigger Popup if drift detected
+                        # -----------------------------
+                        if drift_score > DRIFT_THRESHOLD and \
+                           current_time - last_popup_time > POPUP_COOLDOWN:
 
-                    baseline["kpm"] = (
-                        BASELINE_ALPHA * features["kpm"] +
-                        (1 - BASELINE_ALPHA) * baseline["kpm"]
-                    )
+                            label = show_popup()
 
-                    baseline["backspace_rate"] = (
-                        BASELINE_ALPHA * features["backspace_rate"] +
-                        (1 - BASELINE_ALPHA) * baseline["backspace_rate"]
-                    )
+                            if label is not None:
+                                update_last_n_labels(label, n=2)
 
-                    # Drift-triggered popup
-                    if drift_score > DRIFT_THRESHOLD and \
-                       current_time - last_popup_time > POPUP_COOLDOWN:
-
-                        label = show_popup()
-                        update_last_n_labels(label, n=2)
-                        last_popup_time = current_time
+                            last_popup_time = current_time
 
                 window_index += 1
 
@@ -123,7 +142,12 @@ def main():
 
     except KeyboardInterrupt:
         print("\nMonitoring stopped.")
+        stop_listener()
 
 
+# --------------------------------------------
+# ENTRY POINT
+# --------------------------------------------
 if __name__ == "__main__":
     main()
+

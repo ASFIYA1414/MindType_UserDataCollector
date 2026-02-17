@@ -1,94 +1,135 @@
+from pynput import keyboard
+import time
 import sqlite3
-import pandas as pd
-import numpy as np
-import os
+import threading
+from queue import Queue
+
+# --------------------------------------------
+# Global State
+# --------------------------------------------
+current_session = 1
+user_id = None
+listener_instance = None
+last_key_time = time.time()
+
+IDLE_TIMEOUT = 300  # 5 minutes
+
+event_queue = Queue()
+db_thread = None
+running = False
 
 
-def compute_and_save_features(user_id, session_id, start_time, end_time):
-    conn = sqlite3.connect("keystrokes.db")
+# --------------------------------------------
+# Database Writer Thread
+# --------------------------------------------
+def db_writer():
+    conn = sqlite3.connect("keystrokes.db", check_same_thread=False)
+    cursor = conn.cursor()
 
-    df = pd.read_sql_query("""
-        SELECT * FROM keystrokes
-        WHERE user_id = ?
-        AND session_id = ?
-        AND timestamp >= ?
-        AND timestamp < ?
-        ORDER BY timestamp ASC
-    """, conn, params=(user_id, session_id, start_time, end_time))
+    while running or not event_queue.empty():
+        try:
+            event = event_queue.get(timeout=1)
+            cursor.execute("""
+                INSERT INTO keystrokes
+                (user_id, session_id, condition, key, event_type, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, event)
+            conn.commit()
+        except:
+            continue
 
     conn.close()
 
-    if len(df) < 5:
-        return None
 
-    presses = df[df["event_type"] == "press"].copy()
-    releases = df[df["event_type"] == "release"].copy()
-
-    dwell_times = []
-
-    for i in range(len(presses)):
-        key = presses.iloc[i]["key"]
-        press_time = presses.iloc[i]["timestamp"]
-
-        matching_release = releases[
-            (releases["key"] == key) &
-            (releases["timestamp"] > press_time)
-        ]
-
-        if not matching_release.empty:
-            release_time = matching_release.iloc[0]["timestamp"]
-            dwell_times.append(release_time - press_time)
-
-    if len(dwell_times) == 0:
-        return None
-
-    avg_hold = np.mean(dwell_times)
-    hold_variance = np.var(dwell_times)
-
-    press_times = presses["timestamp"].values
-    pause_times = np.diff(press_times)
-
-    avg_pause = np.mean(pause_times) if len(pause_times) > 0 else 0
-
-    duration_minutes = (end_time - start_time) / 60
-    kpm = len(presses) / duration_minutes if duration_minutes > 0 else 0
-
-    backspace_count = presses["key"].astype(str).str.contains("backspace", case=False).sum()
-    backspace_rate = backspace_count / len(presses)
-
-    row = {
-        "user_id": user_id,
-        "session_id": session_id,
-        "avg_hold": avg_hold,
-        "hold_variance": hold_variance,
-        "avg_pause": avg_pause,
-        "kpm": kpm,
-        "backspace_rate": backspace_rate,
-        "stress_level": None
-    }
-
-    df_out = pd.DataFrame([row])
-
-    file_exists = os.path.isfile("mindtype_dataset.csv")
-
-    df_out.to_csv(
-        "mindtype_dataset.csv",
-        mode="a",
-        header=not file_exists,
-        index=False
-    )
-
-    return row
+# --------------------------------------------
+# Utility Functions
+# --------------------------------------------
+def format_key(key):
+    try:
+        return key.char if key.char is not None else str(key)
+    except AttributeError:
+        return str(key)
 
 
-def update_last_n_labels(label, n=2):
-    df = pd.read_csv("mindtype_dataset.csv")
+def check_idle():
+    global current_session, last_key_time
 
-    if len(df) == 0:
+    if time.time() - last_key_time > IDLE_TIMEOUT:
+        current_session += 1
+        print(f"New session started: {current_session}")
+        last_key_time = time.time()
+
+
+# --------------------------------------------
+# Keyboard Event Handlers
+# --------------------------------------------
+def on_press(key):
+    global user_id, current_session, last_key_time
+
+    if user_id is None:
         return
 
-    start_index = max(len(df) - n, 0)
+    check_idle()
+    last_key_time = time.time()
 
-    df.loc[start_index:, "stress_level"] = label
+    event_queue.put((
+        user_id,
+        current_session,
+        None,
+        format_key(key),
+        "press",
+        time.time()
+    ))
 
-    df.to_csv("mindtype_dataset.csv", index=False)
+
+def on_release(key):
+    global user_id, current_session, last_key_time
+
+    if user_id is None:
+        return
+
+    last_key_time = time.time()
+
+    event_queue.put((
+        user_id,
+        current_session,
+        None,
+        format_key(key),
+        "release",
+        time.time()
+    ))
+
+
+# --------------------------------------------
+# Start Listener
+# --------------------------------------------
+def start_listener(uid):
+    global user_id, listener_instance, db_thread, running
+
+    user_id = uid
+    running = True
+
+    # Start DB writer thread
+    db_thread = threading.Thread(target=db_writer, daemon=True)
+    db_thread.start()
+
+    # Start keyboard listener
+    listener_instance = keyboard.Listener(
+        on_press=on_press,
+        on_release=on_release
+    )
+    listener_instance.start()
+
+
+# --------------------------------------------
+# Stop Listener
+# --------------------------------------------
+def stop_listener():
+    global running, listener_instance
+
+    running = False
+
+    if listener_instance:
+        listener_instance.stop()
+
+    print("Listener stopped.")
