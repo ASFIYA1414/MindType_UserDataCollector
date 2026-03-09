@@ -4,6 +4,8 @@ import numpy as np
 import os
 from collections import defaultdict
 
+from database import get_db_path
+
 
 # -------------------------------------------------
 # Safe dataset path (Documents folder)
@@ -19,7 +21,7 @@ def get_dataset_path():
 # -------------------------------------------------
 def compute_and_save_features(user_id, session_id, start_time, end_time):
 
-    conn = sqlite3.connect("keystrokes.db")
+    conn = sqlite3.connect(get_db_path())
 
     df = pd.read_sql_query("""
         SELECT * FROM keystrokes
